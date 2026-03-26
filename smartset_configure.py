@@ -39,6 +39,11 @@ RUN COMMANDS (copy/paste into the VS Code terminal)
   Steps 1-3, no prompts:
     python smartset_configure.py --ip 10.0.19.37 --serial 38110126 --no-scheme --yes
 
+  --- Debugging a single step ---
+
+  Step 4 only – scheme editor (SMARTset must already be running):
+    python smartset_configure.py --ip 10.0.19.37 --serial 38110126 --step4-only
+
   --- Diagnostics (run while the relevant dialog is open in SMARTset) ---
 
   Inspect CommsApp Configuration controls:
@@ -65,6 +70,7 @@ Arguments:
   --no-scheme   Skip Step 4 (scheme editor) – only update CommsApp + connection settings
   --dry-run     Read and report current values without making any changes
   --yes         Auto-confirm all Y/N prompts (use with care on production meters)
+  --step4-only  Jump straight to Step 4 (Scheme Editor) — for debugging
 """
 
 import argparse
@@ -76,6 +82,9 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+import ctypes
+import ctypes.wintypes
+
 try:
     import pyautogui
     from pywinauto import Application, Desktop
@@ -83,6 +92,37 @@ try:
 except ImportError:
     print("ERROR: Required packages missing. Run:  pip install pywinauto pyautogui")
     sys.exit(1)
+
+# Win32 ComboBox messages — used for reliable combo interaction on 32-bit WinForms.
+CB_GETCOUNT       = 0x0146
+CB_GETCURSEL      = 0x0147
+CB_GETLBTEXTLEN   = 0x0149
+CB_GETLBTEXT      = 0x0148
+CB_SELECTSTRING   = 0x014D
+CB_SETCURSEL      = 0x014E
+_SendMessageW     = ctypes.windll.user32.SendMessageW
+_SendMessageW.argtypes = [ctypes.wintypes.HWND, ctypes.c_uint,
+                          ctypes.wintypes.WPARAM, ctypes.wintypes.LPARAM]
+_SendMessageW.restype  = ctypes.wintypes.LPARAM
+
+
+def _combo_items_win32(hwnd):
+    """Return all items in a Win32 ComboBox by handle, using CB_GETLBTEXT."""
+    count = _SendMessageW(hwnd, CB_GETCOUNT, 0, 0)
+    items = []
+    for i in range(count):
+        length = _SendMessageW(hwnd, CB_GETLBTEXTLEN, i, 0)
+        if length < 0:
+            continue
+        buf = ctypes.create_unicode_buffer(length + 1)
+        _SendMessageW(hwnd, CB_GETLBTEXT, i, ctypes.addressof(buf))
+        items.append(buf.value)
+    return items
+
+
+def _combo_select_win32(hwnd, index):
+    """Select an item in a Win32 ComboBox by index using CB_SETCURSEL."""
+    _SendMessageW(hwnd, CB_SETCURSEL, index, 0)
 
 # --------------------------------------------------------------------------- #
 # Runtime flag – set once in main() from --dry-run CLI argument.
@@ -288,7 +328,8 @@ def _gui_checkbox(control, desired: bool, label: str, step: str):
         _audit(step, f"checkbox:{label}", before, after, applied=False)
     else:
         print(f"  {'Ticking' if desired else 'Unticking'} checkbox '{label}'")
-        control.click()
+        # Use click_input() — UIA Invoke() fails on 32-bit WinForms checkboxes.
+        control.click_input()
         _audit(step, f"checkbox:{label}", before, after, applied=True)
     time.sleep(ACTION_PAUSE)
 
@@ -428,7 +469,7 @@ def _close_window(win):
             {"title": btn_title,        "class_name": "Button"},
         ):
             try:
-                win.child_window(**search_kwargs).click()
+                win.child_window(**search_kwargs).click_input()
                 time.sleep(0.2)
                 return
             except Exception:
@@ -472,7 +513,7 @@ def launch_and_login() -> Application:
     # ── Not running — launch it ───────────────────────────────────────
     print("\n── Step 1: Launch SMARTset and log in ────────────────────────")
     os.startfile(SMARTSET_EXE)
-    time.sleep(STARTUP_WAIT)
+    time.sleep(3)   # brief pause so the process starts before we begin polling
 
     # Wait for the login dialog (title "SMARTset", distinct from main window).
     print("   Waiting for login dialog…")
@@ -498,7 +539,7 @@ def launch_and_login() -> Application:
 
     print(f"   Login dialog found. Entering credentials…")
     login_dlg.set_focus()
-    time.sleep(ACTION_PAUSE)
+    time.sleep(0.1)
 
     # Tab order: User Name (ComboBox) → Password (Edit) → OK → Cancel
     send_keys("^a")
@@ -510,7 +551,7 @@ def launch_and_login() -> Application:
     _audit("Login", "credentials", "", "submitted", applied=True)
 
     print("   Credentials submitted. Waiting for main window…")
-    time.sleep(DIALOG_WAIT)
+    # No fixed sleep here — _get_main_app() polls until Scheme Manager appears.
     print("   Login complete.")
     return _get_main_app()
 
@@ -842,7 +883,7 @@ def _open_comms_app(app):
     # Port configuration panel on the right.  We must also physically click
     # the NET row to trigger that event.
     send_keys("^{END}")
-    time.sleep(0.6)
+    time.sleep(0.3)
 
     # Click near the bottom of the grid where NET is now visible.
     # Using relative coords (x=centre of grid, y=near bottom) so it works
@@ -851,7 +892,7 @@ def _open_comms_app(app):
     rel_x = (rect.right - rect.left) // 2
     rel_y = (rect.bottom - rect.top) - 12   # 12 px above the bottom edge
     port_list.click_input(coords=(rel_x, rel_y))
-    time.sleep(0.5)
+    time.sleep(0.3)
 
     port_config = comms_win.child_window(
         title="Port configuration", class_name="TGroupBox"
@@ -864,7 +905,7 @@ def _close_comms_app(comms_win):
     """Click Cancel to close CommsApp and wait until the window is gone."""
     for btn_class in ("TButton", "Button"):
         try:
-            comms_win.child_window(title="Cancel", class_name=btn_class).click()
+            comms_win.child_window(title="Cancel", class_name=btn_class).click_input()
             break
         except Exception:
             pass
@@ -873,17 +914,15 @@ def _close_comms_app(comms_win):
             comms_win.close()
         except Exception:
             pass
-    # Wait for the window to actually disappear (max 5 s).
-    # exists() returns False (not an exception) when the handle is gone,
-    # so we must check the return value, not catch an exception.
-    deadline = time.time() + 5
+    # Wait for the window to actually disappear (max 3 s).
+    deadline = time.time() + 3
     while time.time() < deadline:
         try:
             if not comms_win.exists():
                 break
         except Exception:
             break
-        time.sleep(0.3)
+        time.sleep(0.15)
 
 
 def configure_comms_server(app, new_ip: str):
@@ -927,18 +966,21 @@ def configure_comms_server(app, new_ip: str):
     ip_field.type_keys(new_ip, with_spaces=False)
     _audit("CommsApp", "NET IP address", current_ip, new_ip, applied=True)
 
-    # Save.
+    # Save.  Use click_input() — win32 .click() sends BM_CLICK and blocks
+    # until the app finishes processing, which can take many seconds if
+    # SMARTset writes to disk/network.  click_input() is a physical click
+    # that returns immediately.
     saved = False
     for btn_class in ("TButton", "Button"):
         try:
-            comms_win.child_window(title="Save", class_name=btn_class).click()
+            comms_win.child_window(title="Save", class_name=btn_class).click_input()
             saved = True
             break
         except Exception:
             pass
     if not saved:
         send_keys("%s")   # Alt+S fallback
-    time.sleep(DIALOG_WAIT)
+    time.sleep(0.5)
     print("  Saved.")
 
     # Close.
@@ -1063,17 +1105,29 @@ def configure_connection(app, new_ip: str, outstation: str):
     no_change = (current_host == new_ip and current_outstation == outstation)
     if no_change:
         print("  No change needed — values already match.")
-        _close_window(amend_win)
+        try:
+            amend_win.child_window(title="&Cancel", control_type="Button").click_input()
+        except Exception:
+            _close_window(amend_win)
         _wait_gone(r"Amend a Connection")
-        _close_window(browse_win)
+        try:
+            browse_win.child_window(auto_id="btnCancel").click_input()
+        except Exception:
+            _close_window(browse_win)
         return
 
     answer = input("\n  Apply these changes? [y/N]: ").strip().lower()
     if answer not in ("y", "yes"):
         print("  Skipped by user.")
-        _close_window(amend_win)
+        try:
+            amend_win.child_window(title="&Cancel", control_type="Button").click_input()
+        except Exception:
+            _close_window(amend_win)
         _wait_gone(r"Amend a Connection")
-        _close_window(browse_win)
+        try:
+            browse_win.child_window(auto_id="btnCancel").click_input()
+        except Exception:
+            _close_window(browse_win)
         return
 
     # Update fields.
@@ -1104,7 +1158,6 @@ def configure_connection(app, new_ip: str, outstation: str):
         browse_win.child_window(auto_id="btnCancel").click()
     except Exception:
         _close_window(browse_win)
-    time.sleep(ACTION_PAUSE)
     print("  Browse Connections closed.")
 
 
@@ -1156,26 +1209,28 @@ def configure_scheme(app):
     time.sleep(ACTION_PAUSE)
 
     # 2. Double-click "A1140 nonTOU" in the right-hand list.
+    #    Use UIA backend for the click — it handles DPI scaling correctly.
+    #    (win32 backend returns wrong screen coordinates when 64-bit Python
+    #    automates a 32-bit WinForms app with display scaling enabled.)
+    main_uia = Application(backend="uia").connect(handle=main_win.handle)
+    main_win_uia = main_uia.window(handle=main_win.handle)
     try:
-        scheme_list = main_win.child_window(auto_id="lvScheme")
+        scheme_list_uia = main_win_uia.child_window(auto_id="lvScheme", control_type="List")
     except Exception:
-        scheme_list = main_win.child_window(control_type="List")
+        scheme_list_uia = main_win_uia.child_window(control_type="List")
     opened = False
-    for item in scheme_list.items():
-        if "a1140" in item.text().lower():
-            try:
-                item.click(double=True)       # _listview_item API
-            except Exception:
-                item.select()
-                send_keys("{ENTER}{ENTER}")
+    for li in scheme_list_uia.children(control_type="ListItem"):
+        if "a1140" in li.window_text().lower():
+            print(f"  Found: '{li.window_text()}' — double-clicking via UIA…")
+            li.double_click_input()
             opened = True
             break
     if not opened:
         raise RuntimeError("Could not find 'A1140 nonTOU' in the Imports list.")
 
+    print("  Waiting for Scheme Editor window…")
     time.sleep(DIALOG_WAIT)
-
-    _wait_for_window(r"(?i)Scheme Editor.*A1140", timeout=15)
+    _wait_for_window(r"(?i)Scheme Editor.*A1140", timeout=30)
     _editor_handle = next(
         (w.handle for w in Desktop(backend="win32").windows()
          if re.search(r"(?i)Scheme Editor.*A1140", w.window_text())),
@@ -1194,46 +1249,51 @@ def configure_scheme(app):
     print("   Configuring Load Profiling…")
     _configure_load_profiling(editor_win_uia)
 
-    # Save via ToolBar button (auto_id="tlsEditor", text="Save").
-    saved = False
-    try:
-        editor_win_uia.child_window(auto_id="tlsEditor").child_window(
-            title="Save", control_type="Button"
-        ).click()
-        saved = True
-    except Exception:
-        pass
-    if not saved:
-        try:
-            editor_win_uia.child_window(title="Save", control_type="Button").click()
-            saved = True
-        except Exception:
-            pass
-    if not saved:
-        send_keys("^s")
+    # Save via Ctrl+S (File → Save).  This is the most reliable method —
+    # the toolbar Save button's UIA control_type varies and click_input()
+    # on toolbar items is unreliable in 32-bit WinForms.
+    print("   Saving scheme (Ctrl+S)…")
+    send_keys("^s")
+    time.sleep(1.0)
     print("   Scheme saved.")
 
-    # Close the editor with OK.
-    try:
-        editor_win_uia.child_window(auto_id="btnOK").click()
-    except Exception:
+    # Close the editor with OK button (bottom-right corner).
+    closed = False
+    for attempt_desc, finder in [
+        ("auto_id=btnOK",    lambda: editor_win_uia.child_window(auto_id="btnOK")),
+        ("title=OK Button",  lambda: editor_win_uia.child_window(title="OK", control_type="Button")),
+        ("title=OK any",     lambda: editor_win_uia.child_window(title="OK")),
+    ]:
         try:
-            editor_win_uia.child_window(title="OK", control_type="Button").click()
-        except Exception:
-            send_keys("{ENTER}")
+            btn = finder()
+            btn.click_input()
+            closed = True
+            print(f"   Clicked OK ({attempt_desc}).")
+            break
+        except Exception as exc:
+            print(f"   OK attempt '{attempt_desc}' failed: {exc}")
+    if not closed:
+        # Last resort: Enter key (OK is typically the default button).
+        print("   Pressing Enter as fallback for OK…")
+        send_keys("{ENTER}")
     time.sleep(DIALOG_WAIT)
     print("   Scheme editor closed.")
 
 
 def _click_scheme_page(editor_win_uia, page_name: str):
     """
-    Navigate to a named page in the Scheme Editor by row index in dgvPages
-    (confirmed by diagnostic: left panel is a DataGridView, NOT a tree).
+    Navigate to a named page in the Scheme Editor by row index in dgvPages.
+    The left panel dgvPages is inside spcMain (SplitContainer).
+    There are TWO dgvPages — the left panel one and the right panel one inside
+    pnlEditor/pnlSummary.  We scope to spcMain's first child pane to avoid
+    ElementAmbiguousError.
     """
     row = PAGE_ROW.get(page_name, -1)
     if row < 0:
         raise RuntimeError(f"Unknown scheme page: {page_name!r}")
-    dgv = editor_win_uia.child_window(auto_id="dgvPages")
+    # Left panel dgvPages is the FIRST dgvPages in the UIA tree (found_index=0).
+    # The second dgvPages is inside pnlEditor/pnlSummary (right panel).
+    dgv = editor_win_uia.child_window(auto_id="dgvPages", found_index=0)
     dgv.click_input()
     time.sleep(0.2)
     send_keys("^{HOME}")      # row 0 = Summary Page
@@ -1263,20 +1323,23 @@ def _clear_scheme_page(editor_win_uia, page_name: str):
         pass  # Page may already be <None> – safe to ignore.
 
 
-def _find_checkbox(editor_win_uia, label: str):
+def _find_checkbox(parent_uia, label: str):
     """
-    Locate a checkbox in the editor window by its label text.
-    Tries the exact label, then label without spaces, then a substring scan.
+    Locate a checkbox under *parent_uia* whose text matches *label*.
+    Uses descendants() which returns resolved UIAWrapper objects (not lazy
+    WindowSpecifications), so there is no risk of returning an unresolved spec.
     Returns None if not found so callers can warn gracefully.
     """
-    for title_variant in (label, label.replace(" ", ""), f"&{label}"):
-        try:
-            return editor_win_uia.child_window(title=title_variant, control_type="CheckBox")
-        except Exception:
-            continue
-    # Substring scan across all checkboxes recursively.
-    for cb in editor_win_uia.descendants(control_type="CheckBox"):
-        if label.lower() in cb.window_text().lower():
+    label_lower = label.lower()
+    # First pass: exact match only (avoids "VA 1" matching "VA 12" etc.)
+    for cb in parent_uia.descendants(control_type="CheckBox"):
+        txt = cb.window_text().lower().strip()
+        if txt == label_lower or txt == label_lower.replace(" ", ""):
+            return cb
+    # Second pass: substring match as fallback
+    for cb in parent_uia.descendants(control_type="CheckBox"):
+        txt = cb.window_text().lower().strip()
+        if label_lower in txt:
             return cb
     return None
 
@@ -1288,17 +1351,31 @@ def _enable_led_section(group_pane, label: str):
     with auto_id='ledIcon' — clicking it toggles the section on/off.
     """
     try:
-        # Sample any direct child that has an 'is_enabled' method.
-        for child in group_pane.children():
+        # Check descendants (not just direct children) for an interactive control.
+        need_enable = False
+        for child in group_pane.descendants():
             ct = child.element_info.control_type
             if ct in ("CheckBox", "ComboBox", "Edit"):
                 if not child.is_enabled():
-                    print(f"   Enabling '{label}' section…")
-                    group_pane.child_window(auto_id="ledIcon").click_input()
-                    time.sleep(0.3)
-                return  # state confirmed, nothing more to do
-    except Exception:
-        pass
+                    need_enable = True
+                break  # found an interactive control — verdict reached
+
+        if need_enable:
+            print(f"   Enabling '{label}' section…")
+            led = group_pane.child_window(auto_id="ledIcon")
+            led.click_input()
+            time.sleep(0.5)
+            # Verify it actually enabled — if not, try once more.
+            for child in group_pane.descendants():
+                ct = child.element_info.control_type
+                if ct in ("CheckBox", "ComboBox", "Edit"):
+                    if not child.is_enabled():
+                        print(f"   Retrying LED click for '{label}'…")
+                        led.click_input()
+                        time.sleep(0.5)
+                    break
+    except Exception as exc:
+        print(f"   WARNING: Could not enable '{label}' section: {exc}")
 
 
 def _configure_load_profiling(editor_win_uia):
@@ -1309,23 +1386,70 @@ def _configure_load_profiling(editor_win_uia):
         pnlDemandPeriod → cgbDemandPeriod → ledIcon + ComboBox
     """
     _click_scheme_page(editor_win_uia, "Load Profiling")
+    time.sleep(1.0)  # let the Load Profiling panel load
 
-    lp = editor_win_uia.child_window(auto_id="ECLoadProfileConfigEditor")
+    # The Load Profiling config panel may not appear immediately in the UIA
+    # tree after navigating to the page.  Search for it with retries.
+    lp = None
+    for attempt in range(8):
+        try:
+            for desc in editor_win_uia.descendants():
+                aid = getattr(desc.element_info, 'auto_id', '') or ''
+                if aid == "ECLoadProfileConfigEditor":
+                    lp = desc
+                    break
+        except Exception:
+            pass
+        if lp is not None:
+            break
+        print(f"   Waiting for Load Profiling panel (attempt {attempt + 1})…")
+        time.sleep(1.0)
+    if lp is None:
+        raise RuntimeError("ECLoadProfileConfigEditor not found after navigating to Load Profiling.")
+    print(f"   Load Profiling panel found.")
 
     # ── Demand Period ─────────────────────────────────────────────────────────
-    demand_pnl = lp.child_window(auto_id="pnlDemandPeriod")
+    # Use child_window specs from the resolved wrapper via a fresh spec.
+    lp_spec = editor_win_uia.child_window(auto_id="ECLoadProfileConfigEditor")
+    demand_pnl = lp_spec.child_window(auto_id="pnlDemandPeriod")
     demand_grp = demand_pnl.child_window(auto_id="cgbDemandPeriod")
     _enable_led_section(demand_grp, "Demand Period")
 
-    # Set the ComboBox to 30 Minutes (only one ComboBox in pnlDemandPeriod).
+    # Set the Demand Period ComboBox to the item containing "30".
+    # UIA window_text() does NOT update when arrowing through a closed WinForms
+    # ComboBox, so we use native Win32 messages (CB_GETCOUNT / CB_GETLBTEXT /
+    # CB_SETCURSEL) to read items and select by index — 100% reliable.
     try:
-        combo = demand_pnl.child_window(control_type="ComboBox")
-        items = combo.item_texts()
-        target = next((t for t in items if "30" in t), None)
-        if target:
-            _gui_select(combo, target, "Demand Period", step="Scheme")
+        combo = demand_grp.child_window(control_type="ComboBox")
+        combo_hwnd = combo.wrapper_object().handle
+
+        items = _combo_items_win32(combo_hwnd)
+        print(f"   Demand Period items: {items}")
+        cur_sel = _SendMessageW(combo_hwnd, CB_GETCURSEL, 0, 0)
+        current = items[cur_sel] if 0 <= cur_sel < len(items) else ""
+        print(f"   Demand Period current: '{current}' (index {cur_sel})")
+
+        # Find the item containing "30".
+        target_idx = -1
+        for i, item in enumerate(items):
+            if "30" in item:
+                target_idx = i
+                break
+
+        if target_idx < 0:
+            print(f"   WARNING: No item containing '30' found in {items}")
+        elif cur_sel == target_idx:
+            print(f"   Demand Period already set to '{current}' – skipping.")
+        elif not DRY_RUN:
+            target_text = items[target_idx]
+            print(f"   Setting Demand Period: '{current}' → '{target_text}'")
+            _combo_select_win32(combo_hwnd, target_idx)
+            time.sleep(0.3)
+            _audit("Scheme", "Demand Period", current, target_text, applied=True)
         else:
-            print(f"   WARNING: no '30' item in Demand Period dropdown: {items}")
+            target_text = items[target_idx]
+            print(f"   [DRY RUN] Would set Demand Period: '{current}' → '{target_text}'")
+            _audit("Scheme", "Demand Period", current, target_text, applied=False)
     except Exception as exc:
         print(f"   WARNING: Demand Period ComboBox error: {exc}")
 
@@ -1334,14 +1458,45 @@ def _configure_load_profiling(editor_win_uia):
     channels_grp = channels_pnl.child_window(auto_id="cgbChannels")
     _enable_led_section(channels_grp, "Load Profile Definition")
 
-    # Set each channel checkbox to the correct state.
-    for ch in ALL_CHANNELS:
-        desired = ch in LOAD_PROFILE_CHANNELS
-        cb = _find_checkbox(editor_win_uia, ch)
-        if cb:
+    # Dump all checkbox names for diagnostics.
+    all_cbs = channels_grp.descendants(control_type="CheckBox")
+    all_cbs = sorted(all_cbs, key=lambda c: (c.rectangle().top, c.rectangle().left))
+    print(f"   Found {len(all_cbs)} checkboxes (sorted by screen position):")
+    for i, cb in enumerate(all_cbs):
+        txt = cb.window_text()
+        r = cb.rectangle()
+        aid = getattr(cb.element_info, 'auto_id', '') or ''
+        state = "ON" if cb.get_toggle_state() == 1 else "OFF"
+        print(f"     [{i}] '{txt}' auto_id='{aid}' state={state} rect=({r.left},{r.top})-({r.right},{r.bottom})")
+
+    # UIA window_text() is unreliable for 32-bit WinForms — adjacent
+    # checkboxes can have their names swapped (e.g. "VA 1" ↔ "VA 2").
+    # The toggle STATE is always correct for the physical control, though.
+    #
+    # Fix: sort checkboxes by screen position (top, left) and match them
+    # to ALL_CHANNELS by index.  ALL_CHANNELS is in the exact visual order
+    # (left column top-to-bottom, then right column top-to-bottom), and the
+    # position sort gives the same order.  This bypasses window_text()
+    # entirely for the name → control mapping.
+    if len(all_cbs) != len(ALL_CHANNELS):
+        print(f"   WARNING: expected {len(ALL_CHANNELS)} checkboxes, found {len(all_cbs)}.")
+        # Fall back to text-based matching (best effort).
+        cb_map = {}
+        for cb in all_cbs:
+            txt = cb.window_text().strip()
+            if txt:
+                cb_map[txt] = cb
+        for ch in ALL_CHANNELS:
+            desired = ch in LOAD_PROFILE_CHANNELS
+            ctrl = cb_map.get(ch)
+            if ctrl:
+                _gui_checkbox(ctrl, desired, ch, step="Scheme")
+            else:
+                print(f"   WARNING: checkbox '{ch}' not found.")
+    else:
+        for ch, cb in zip(ALL_CHANNELS, all_cbs):
+            desired = ch in LOAD_PROFILE_CHANNELS
             _gui_checkbox(cb, desired, ch, step="Scheme")
-        else:
-            print(f"   WARNING: checkbox '{ch}' not found.")
 
     time.sleep(ACTION_PAUSE)
 
@@ -1443,7 +1598,9 @@ def parse_args() -> argparse.Namespace:
             "  # Dry run (read + plan, no changes):\n"
             "  python smartset_configure.py --ip 10.0.19.37 --serial 38110126 --dry-run\n\n"
             "  # Skip confirmation prompt:\n"
-            "  python smartset_configure.py --ip 10.0.19.37 --serial 38110126 --yes\n"
+            "  python smartset_configure.py --ip 10.0.19.37 --serial 38110126 --yes\n\n"
+            "  # Step 4 only (scheme editor) — for debugging, requires SMARTset already open:\n"
+            "  python smartset_configure.py --ip 10.0.19.37 --serial 38110126 --step4-only\n"
         ),
     )
     parser.add_argument(
@@ -1478,6 +1635,16 @@ def parse_args() -> argparse.Namespace:
             "update connectivity settings without touching meter configuration."
         ),
     )
+    parser.add_argument(
+        "--step4-only",
+        action="store_true",
+        default=False,
+        help=(
+            "Jump straight to Step 4 (Scheme Editor). "
+            "Requires SMARTset to be already running with Scheme Manager open. "
+            "Useful for debugging the Scheme Editor step in isolation."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -1506,6 +1673,18 @@ def main():
     print(f"  Serial      : {args.serial}  →  Outstation: {outstation}")
     print(f"  Scheme step : {'SKIPPED (--no-scheme)' if args.no_scheme else 'included'}")
     print("=" * 62)
+
+    # ── Step 4 only (debugging shortcut) ────────────────────────────
+    if args.step4_only:
+        if not _smartset_already_running():
+            print("ERROR: --step4-only requires SMARTset to be already running.")
+            return
+        app = _get_main_app()
+        print("\n── Step 4 only mode ─────────────────────────────────────────")
+        configure_scheme(app)
+        _write_audit_log(args.serial)
+        print("\nDone (step 4 only).")
+        return
 
     # ── Step 1 – Launch SMARTset and log in ───────────────────────────
     already_running = _smartset_already_running()
