@@ -219,29 +219,58 @@ _AUDIT_ROWS: list[dict] = []
 
 
 def _audit(step: str, field: str, before: str, after: str, applied: bool):
-    """Append one row to the in-memory audit log."""
+    """Append one row to the in-memory audit log with full change details."""
     _AUDIT_ROWS.append({
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "step":      step,
         "field":     field,
-        "before":    before,
-        "after":     after,
-        # Mark whether the change was actually applied or was a dry-run record.
-        "applied":   "DRY RUN" if not applied else "YES",
+        "initial_value":    before,
+        "final_value":      after,
+        "changed":          "NO" if before == after else "YES",
+        "applied":          "DRY RUN" if not applied else "YES",
     })
 
 
 def _write_audit_log(serial: str) -> Path:
-    """Write all collected audit rows to a timestamped CSV file."""
-    ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
+    """
+    Write all collected audit rows to a timestamped CSV file.
+    Includes configuration metadata and change summary for rollback support.
+    """
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     path = Path(__file__).parent / f"audit_{serial}_{ts}.csv"
+
     with path.open("w", newline="") as fh:
-        writer = csv.DictWriter(
-            fh,
-            fieldnames=["timestamp", "step", "field", "before", "after", "applied"],
-        )
-        writer.writeheader()
-        writer.writerows(_AUDIT_ROWS)
+        # Write header with metadata
+        fh.write(f"# Audit Log\n")
+        fh.write(f"# Serial Number: {serial}\n")
+        fh.write(f"# Generated: {datetime.now().isoformat()}\n")
+        fh.write(f"# SMARTset Path: {SMARTSET_EXE}\n")
+        fh.write(f"# Dry Run: {DRY_RUN}\n")
+        fh.write(f"#\n")
+
+        # Write CSV data
+        if _AUDIT_ROWS:
+            fieldnames = ["timestamp", "step", "field", "initial_value", "final_value", "changed", "applied"]
+            writer = csv.DictWriter(fh, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(_AUDIT_ROWS)
+
+        fh.write(f"#\n")
+        fh.write(f"# Summary:\n")
+
+        # Count changes by step
+        changes_by_step = {}
+        for row in _AUDIT_ROWS:
+            step = row.get("step", "Unknown")
+            if step not in changes_by_step:
+                changes_by_step[step] = {"total": 0, "changed": 0}
+            changes_by_step[step]["total"] += 1
+            if row.get("changed") == "YES":
+                changes_by_step[step]["changed"] += 1
+
+        for step, counts in sorted(changes_by_step.items()):
+            fh.write(f"# {step}: {counts['changed']} changes out of {counts['total']} values\n")
+
     print(f"\nAudit log written to: {path}")
     return path
 
@@ -309,19 +338,24 @@ def _gui_select(control, value, field_name: str, step: str):
 
 
 def _gui_checkbox(control, desired: bool, label: str, step: str):
-    """Tick or untick a checkbox, but only if it isn't already in the desired state."""
+    """
+    Tick or untick a checkbox, but only if it isn't already in the desired state.
+    Always audits the checkbox state (even when no change needed) for rollback support.
+    """
     try:
         current_state = control.get_toggle_state() == 1
     except Exception:
         current_state = None
 
+    before = str(current_state)
+    after  = str(desired)
+
     # No-op if already in the right state – avoids unnecessary clicks.
     if current_state == desired:
         print(f"  Checkbox '{label}' already {'ticked' if desired else 'unticked'} – skipping.")
+        # Always audit for rollback support, even when no change needed
+        _audit(step, f"checkbox:{label}", before, after, applied=True)
         return
-
-    before = str(current_state)
-    after  = str(desired)
 
     if DRY_RUN:
         print(f"  [DRY RUN] Would {'tick' if desired else 'untick'} checkbox '{label}'")
@@ -947,6 +981,7 @@ def configure_comms_server(app, new_ip: str):
 
     if current_ip == new_ip:
         print("  No change needed — values already match.")
+        _audit("CommsApp", "NET IP address", current_ip, new_ip, applied=True)
         _close_comms_app(comms_win)
         return
 
@@ -1105,6 +1140,8 @@ def configure_connection(app, new_ip: str, outstation: str):
     no_change = (current_host == new_ip and current_outstation == outstation)
     if no_change:
         print("  No change needed — values already match.")
+        _audit("Connections", "Host", current_host, new_ip, applied=True)
+        _audit("Connections", "Outstation", current_outstation, outstation, applied=True)
         try:
             amend_win.child_window(title="&Cancel", control_type="Button").click_input()
         except Exception:
@@ -1194,39 +1231,60 @@ def configure_scheme(app):
     #   - Clicking "Imports" populates the right-hand list (auto_id="lvScheme")
     #   - "A1140 nonTOU" is a ListItem in lvScheme — double-clicking it opens Scheme Editor
 
-    # 1. Click "Imports" in the left tree.
-    try:
-        tree = main_win.child_window(auto_id="trvScheme")
-    except Exception:
-        tree = main_win.child_window(control_type="Tree")
-    try:
-        tree.get_item(["Imports"]).click()
-    except Exception:
-        for item in tree.items():
-            if item.text().lower() == "imports":
-                item.click()
-                break
-    time.sleep(ACTION_PAUSE)
-
-    # 2. Double-click "A1140 nonTOU" in the right-hand list.
-    #    Use UIA backend for the click — it handles DPI scaling correctly.
-    #    (win32 backend returns wrong screen coordinates when 64-bit Python
-    #    automates a 32-bit WinForms app with display scaling enabled.)
+    # Use UIA backend for ALL tree/list interaction in Step 4.
+    # win32 backend returns DPI-wrong screen coordinates when 64-bit Python
+    # automates a 32-bit WinForms app with display scaling — clicks land on
+    # the wrong tree item (e.g. "Trash Can" instead of "Imports").
     main_uia = Application(backend="uia").connect(handle=main_win.handle)
     main_win_uia = main_uia.window(handle=main_win.handle)
+
+    # 1. Click "Imports" in the left tree via UIA (DPI-aware coordinates).
+    clicked_imports = False
+    try:
+        tree_uia = main_win_uia.child_window(auto_id="trvScheme", control_type="Tree")
+        for item in tree_uia.children(control_type="TreeItem"):
+            if "imports" in item.window_text().lower():
+                print(f"  Clicking tree item: '{item.window_text()}'")
+                item.click_input()
+                clicked_imports = True
+                break
+    except Exception as exc:
+        print(f"  WARNING: UIA tree click failed: {exc}")
+    if not clicked_imports:
+        # Last resort: win32 (may land in wrong place on high-DPI but better than nothing)
+        try:
+            tree_w32 = main_win.child_window(auto_id="trvScheme")
+            tree_w32.get_item(["Imports"]).click()
+        except Exception:
+            pass
+    time.sleep(ACTION_PAUSE)
+
+    # 2. Double-click "A1140 nonTOU" in the right-hand list via UIA.
+    # Give the list extra time to populate after clicking Imports.
+    time.sleep(1.5)
     try:
         scheme_list_uia = main_win_uia.child_window(auto_id="lvScheme", control_type="List")
     except Exception:
         scheme_list_uia = main_win_uia.child_window(control_type="List")
+
+    # Print all items in the list for diagnostics.
+    all_items = scheme_list_uia.children(control_type="ListItem")
+    print(f"  Items in list ({len(all_items)} found):")
+    for li in all_items:
+        print(f"    '{li.window_text()}'")
+
     opened = False
-    for li in scheme_list_uia.children(control_type="ListItem"):
+    for li in all_items:
         if "a1140" in li.window_text().lower():
             print(f"  Found: '{li.window_text()}' — double-clicking via UIA…")
             li.double_click_input()
             opened = True
             break
     if not opened:
-        raise RuntimeError("Could not find 'A1140 nonTOU' in the Imports list.")
+        raise RuntimeError(
+            f"Could not find 'A1140 nonTOU' in the Imports list. "
+            f"Items found: {[li.window_text() for li in all_items]}"
+        )
 
     print("  Waiting for Scheme Editor window…")
     time.sleep(DIALOG_WAIT)
@@ -1394,7 +1452,8 @@ def _configure_load_profiling(editor_win_uia):
     for attempt in range(8):
         try:
             for desc in editor_win_uia.descendants():
-                aid = getattr(desc.element_info, 'auto_id', '') or ''
+                # UIA attribute is automation_id, not auto_id
+                aid = getattr(desc.element_info, 'automation_id', '') or ''
                 if aid == "ECLoadProfileConfigEditor":
                     lp = desc
                     break
@@ -1408,8 +1467,8 @@ def _configure_load_profiling(editor_win_uia):
         raise RuntimeError("ECLoadProfileConfigEditor not found after navigating to Load Profiling.")
     print(f"   Load Profiling panel found.")
 
-    # ── Demand Period ─────────────────────────────────────────────────────────
-    # Use child_window specs from the resolved wrapper via a fresh spec.
+    # Use lp_spec (WindowSpecification) for child_window() calls.
+    # UIAWrapper (lp) does not have child_window() — only WindowSpecification does.
     lp_spec = editor_win_uia.child_window(auto_id="ECLoadProfileConfigEditor")
     demand_pnl = lp_spec.child_window(auto_id="pnlDemandPeriod")
     demand_grp = demand_pnl.child_window(auto_id="cgbDemandPeriod")
@@ -1454,30 +1513,47 @@ def _configure_load_profiling(editor_win_uia):
         print(f"   WARNING: Demand Period ComboBox error: {exc}")
 
     # ── Load Profile Definition (channels) ───────────────────────────────────
-    channels_pnl = lp.child_window(auto_id="pnlChannels")
+    channels_pnl = lp_spec.child_window(auto_id="pnlChannels")
     channels_grp = channels_pnl.child_window(auto_id="cgbChannels")
     _enable_led_section(channels_grp, "Load Profile Definition")
 
     # Dump all checkbox names for diagnostics.
     all_cbs = channels_grp.descendants(control_type="CheckBox")
-    all_cbs = sorted(all_cbs, key=lambda c: (c.rectangle().top, c.rectangle().left))
-    print(f"   Found {len(all_cbs)} checkboxes (sorted by screen position):")
+
+    # The checkboxes are in a 2-column layout.  Sorting by (top, left) would
+    # interleave both columns — e.g. "Customer Defined 1" (right column, same
+    # top as "Import W") ends up at index 1 instead of index 8, shifting every
+    # subsequent match.
+    # Fix: split into left and right columns by x midpoint, sort each column
+    # by top independently, then concatenate left + right.  This matches the
+    # order of ALL_CHANNELS exactly.
+    if all_cbs:
+        x_vals = [cb.rectangle().left for cb in all_cbs]
+        x_mid = (min(x_vals) + max(x_vals)) / 2
+        left_col  = sorted([cb for cb in all_cbs if cb.rectangle().left <= x_mid],
+                           key=lambda c: c.rectangle().top)
+        right_col = sorted([cb for cb in all_cbs if cb.rectangle().left > x_mid],
+                           key=lambda c: c.rectangle().top)
+        all_cbs = left_col + right_col
+    else:
+        x_mid = 0
+
+    print(f"   Found {len(all_cbs)} checkboxes (left col then right col, each top→bottom):")
     for i, cb in enumerate(all_cbs):
         txt = cb.window_text()
         r = cb.rectangle()
-        aid = getattr(cb.element_info, 'auto_id', '') or ''
+        aid = getattr(cb.element_info, 'automation_id', '') or ''
         state = "ON" if cb.get_toggle_state() == 1 else "OFF"
-        print(f"     [{i}] '{txt}' auto_id='{aid}' state={state} rect=({r.left},{r.top})-({r.right},{r.bottom})")
+        col = "L" if r.left <= x_mid else "R"
+        print(f"     [{i}] col={col} '{txt}' auto_id='{aid}' state={state} rect=({r.left},{r.top})")
 
     # UIA window_text() is unreliable for 32-bit WinForms — adjacent
     # checkboxes can have their names swapped (e.g. "VA 1" ↔ "VA 2").
     # The toggle STATE is always correct for the physical control, though.
     #
-    # Fix: sort checkboxes by screen position (top, left) and match them
-    # to ALL_CHANNELS by index.  ALL_CHANNELS is in the exact visual order
-    # (left column top-to-bottom, then right column top-to-bottom), and the
-    # position sort gives the same order.  This bypasses window_text()
-    # entirely for the name → control mapping.
+    # Fix: sort checkboxes by visual screen layout and match them to ALL_CHANNELS
+    # by index. ALL_CHANNELS is in the exact visual order (left column top-to-bottom,
+    # then right column top-to-bottom).  This bypasses window_text() entirely.
     if len(all_cbs) != len(ALL_CHANNELS):
         print(f"   WARNING: expected {len(ALL_CHANNELS)} checkboxes, found {len(all_cbs)}.")
         # Fall back to text-based matching (best effort).
@@ -1691,11 +1767,15 @@ def main():
     if already_running:
         print("\n── Step 1: SMARTset already running ──────────────────────────")
         print("  Scheme Manager window is open — skipping launch and login.")
+        _audit("Launch", "SMARTset status", "", "already running", applied=True)
+        _audit("Launch", "SMARTset path", "", SMARTSET_EXE, applied=True)
         if not _ask_proceed("Step 2 directly (FLAG Communications Server Setup)"):
             print("Exited at user request.")
             return
         app = _get_main_app()
     else:
+        _audit("Launch", "SMARTset status", "", "launched and logged in", applied=True)
+        _audit("Launch", "SMARTset path", "", SMARTSET_EXE, applied=True)
         app = launch_and_login()
 
     # ── Step 2 – CommsApp ─────────────────────────────────────────────
